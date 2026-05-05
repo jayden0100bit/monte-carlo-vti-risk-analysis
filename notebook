@@ -1,0 +1,736 @@
+"""
+Monte Carlo Simulation of VTI Portfolio Risk
+=============================================
+Uses real historical price data from VTI (Vanguard Total Stock Market ETF)
+to estimate return parameters, then simulates thousands of future portfolio
+trajectories to quantify investment risk.
+
+Dependencies: yfinance, numpy, pandas, matplotlib
+Author: Portfolio Project
+License: MIT
+"""
+
+import warnings
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.ticker as mticker
+
+warnings.filterwarnings("ignore")
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Configuration
+# ──────────────────────────────────────────────────────────────────────────────
+
+TICKER          = "VTI"          # Vanguard Total Stock Market ETF
+INITIAL_VALUE   = 10_000         # Starting portfolio value (USD)
+TIME_HORIZON    = 252            # Trading days to simulate (252 ≈ 1 year)
+NUM_SIMULATIONS = 10_000         # Monte Carlo paths
+LOOKBACK_YEARS  = 5              # Years of historical data to use for calibration
+RANDOM_SEED     = 42             # For reproducibility
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  1. Data Collection
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_data(
+    ticker: str = TICKER,
+    lookback_years: int = LOOKBACK_YEARS,
+) -> pd.Series:
+    """
+    Download adjusted closing prices from Yahoo Finance via yfinance.
+
+    Falls back to a synthetic dataset (calibrated to VTI's historical
+    characteristics) when network access is unavailable, so the project
+    runs end-to-end in restricted environments.
+
+    Parameters
+    ----------
+    ticker        : str  – Yahoo Finance ticker symbol (default "VTI")
+    lookback_years: int  – Years of history to pull (default 5)
+
+    Returns
+    -------
+    pd.Series  – Daily adjusted closing prices indexed by date.
+    """
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=lookback_years * 365)
+
+    try:
+        import yfinance as yf
+
+        print(f"  ⬇  Downloading {ticker} data ({start_date.date()} → {end_date.date()}) …")
+        raw = yf.download(
+            ticker,
+            start=start_date.strftime("%Y-%m-%d"),
+            end=end_date.strftime("%Y-%m-%d"),
+            auto_adjust=True,
+            progress=False,
+        )
+
+        if raw.empty:
+            raise ValueError("yfinance returned an empty DataFrame.")
+
+        # Handle multi-level columns that newer yfinance versions produce
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+
+        prices = raw["Close"].dropna()
+
+        if len(prices) < 60:
+            raise ValueError(f"Insufficient data: only {len(prices)} rows returned.")
+
+        print(f"  ✅  Downloaded {len(prices)} trading days of {ticker} data.\n")
+        return prices
+
+    except Exception as exc:
+        print(f"  ⚠️   Could not fetch live data ({exc}).")
+        print(f"  ↩   Using synthetic VTI-calibrated data for demonstration.\n")
+        return _generate_synthetic_vti(lookback_years)
+
+
+def _generate_synthetic_vti(lookback_years: int) -> pd.Series:
+    """
+    Generate synthetic price series calibrated to VTI's historical parameters.
+    Used as a graceful fallback when yfinance cannot reach the network.
+
+    VTI historical reference (2019-2024):
+        Annual return  ≈ 14%  →  daily mu  ≈ 0.00055
+        Annual vol     ≈ 18%  →  daily sigma ≈ 0.0113
+    """
+    rng        = np.random.default_rng(RANDOM_SEED)
+    n_days     = lookback_years * 252
+    mu_daily   = 0.00055
+    sig_daily  = 0.0113
+
+    log_returns = rng.normal(
+        loc   = mu_daily - 0.5 * sig_daily ** 2,
+        scale = sig_daily,
+        size  = n_days,
+    )
+    price_series = 200.0 * np.exp(np.cumsum(log_returns))   # start ≈ $200 (2019 VTI level)
+
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=n_days * 1.4)    # account for weekends
+    dates      = pd.bdate_range(end=end_date, periods=n_days)
+
+    return pd.Series(price_series, index=dates, name="Close (synthetic VTI)")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  2. Return Calculation & Parameter Estimation
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ReturnStats:
+    """Descriptive statistics estimated from historical returns."""
+    mu_daily:    float          # Mean daily return
+    sigma_daily: float          # Std-dev of daily returns
+    mu_annual:   float          # Annualised return (×252)
+    sigma_annual: float         # Annualised volatility (×√252)
+    total_return: float         # Cumulative return over the sample window
+    sharpe_approx: float        # Approx. Sharpe ratio (risk-free = 0)
+    n_obs:        int           # Number of return observations
+    prices:       pd.Series = field(repr=False)
+    returns:      pd.Series = field(repr=False)
+
+
+def calculate_returns(prices: pd.Series) -> ReturnStats:
+    """
+    Compute daily log-returns and estimate statistical parameters.
+
+    Using log-returns (ln(P_t / P_{t-1})) rather than simple percentage
+    changes because they are additive across time and better suited to
+    the normal-distribution assumption.
+
+    Parameters
+    ----------
+    prices : pd.Series  – Adjusted closing price series.
+
+    Returns
+    -------
+    ReturnStats  – Estimated parameters and descriptive statistics.
+    """
+    log_returns = np.log(prices / prices.shift(1)).dropna()
+
+    mu_daily    = float(log_returns.mean())
+    sigma_daily = float(log_returns.std())
+    mu_annual   = mu_daily * 252
+    sigma_annual = sigma_daily * np.sqrt(252)
+
+    total_return = float((prices.iloc[-1] / prices.iloc[0]) - 1)
+    sharpe_approx = mu_annual / sigma_annual if sigma_annual > 0 else 0.0
+
+    print("  📐  Historical Parameter Estimates")
+    print(f"      Daily μ  (mean log-return) : {mu_daily:.6f}")
+    print(f"      Daily σ  (volatility)      : {sigma_daily:.6f}")
+    print(f"      Annual μ                   : {mu_annual * 100:.2f}%")
+    print(f"      Annual σ                   : {sigma_annual * 100:.2f}%")
+    print(f"      Total return ({len(log_returns)} days)  : {total_return * 100:.1f}%")
+    print(f"      Approx. Sharpe ratio       : {sharpe_approx:.2f}\n")
+
+    return ReturnStats(
+        mu_daily     = mu_daily,
+        sigma_daily  = sigma_daily,
+        mu_annual    = mu_annual,
+        sigma_annual = sigma_annual,
+        total_return = total_return,
+        sharpe_approx = sharpe_approx,
+        n_obs        = len(log_returns),
+        prices       = prices,
+        returns      = log_returns,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  3. Monte Carlo Simulation
+# ──────────────────────────────────────────────────────────────────────────────
+
+def simulate_portfolio(
+    stats: ReturnStats,
+    initial_value: float = INITIAL_VALUE,
+    time_horizon:  int   = TIME_HORIZON,
+    num_sims:      int   = NUM_SIMULATIONS,
+    seed:          int   = RANDOM_SEED,
+) -> np.ndarray:
+    """
+    Simulate portfolio value paths using Geometric Brownian Motion.
+
+    Each path follows:
+        V(t+1) = V(t) × exp(r_t)
+        r_t ~ N(μ - 0.5σ², σ²)
+
+    The Itô correction (−0.5σ²) ensures the expected portfolio value
+    equals S₀ × exp(μT), keeping the simulation unbiased.
+
+    Parameters
+    ----------
+    stats         : ReturnStats  – Calibrated parameters from historical data.
+    initial_value : float        – Starting portfolio value in USD.
+    time_horizon  : int          – Number of trading days to project.
+    num_sims      : int          – Number of independent paths to generate.
+    seed          : int          – Random seed for reproducibility.
+
+    Returns
+    -------
+    np.ndarray, shape (time_horizon + 1, num_sims)
+        Portfolio value at every time step across all simulated paths.
+    """
+    rng   = np.random.default_rng(seed)
+    drift = stats.mu_daily - 0.5 * stats.sigma_daily ** 2
+
+    # Draw ALL random shocks at once — fully vectorised, no Python loops
+    shocks = rng.normal(
+        loc   = drift,
+        scale = stats.sigma_daily,
+        size  = (time_horizon, num_sims),
+    )
+
+    # Convert daily log-returns to cumulative price paths
+    log_paths = np.vstack([np.zeros((1, num_sims)), np.cumsum(shocks, axis=0)])
+    paths     = initial_value * np.exp(log_paths)   # shape: (T+1, N)
+
+    print(f"  🎲  Simulation complete: {num_sims:,} paths × {time_horizon} days generated.\n")
+    return paths
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  4. Risk Metrics
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class RiskMetrics:
+    """All computed portfolio risk and return metrics."""
+    initial_value:  float
+    expected_value: float
+    median_value:   float
+    std_deviation:  float
+    min_value:      float
+    max_value:      float
+    prob_of_loss:   float   # Fraction of paths ending below initial investment
+    var_95:         float   # Value at Risk — 5th percentile of final distribution
+    cvar_95:        float   # Conditional VaR — mean of worst 5% outcomes
+    expected_gain:  float   # Expected P&L in dollar terms
+    expected_gain_pct: float
+
+
+def calculate_metrics(
+    paths:         np.ndarray,
+    initial_value: float,
+) -> RiskMetrics:
+    """
+    Derive risk metrics from the final portfolio values across all simulations.
+
+    Parameters
+    ----------
+    paths         : np.ndarray – Simulation output, shape (T+1, N).
+    initial_value : float      – Starting portfolio value.
+
+    Returns
+    -------
+    RiskMetrics  – Fully populated risk metrics dataclass.
+    """
+    final = paths[-1, :]
+
+    var_95       = float(np.percentile(final, 5))
+    tail_losses  = final[final <= var_95]
+    cvar_95      = float(tail_losses.mean()) if len(tail_losses) > 0 else var_95
+
+    exp_val    = float(final.mean())
+    exp_gain   = exp_val - initial_value
+    exp_gain_pct = (exp_gain / initial_value) * 100
+
+    return RiskMetrics(
+        initial_value    = initial_value,
+        expected_value   = exp_val,
+        median_value     = float(np.median(final)),
+        std_deviation    = float(final.std()),
+        min_value        = float(final.min()),
+        max_value        = float(final.max()),
+        prob_of_loss     = float(np.mean(final < initial_value)),
+        var_95           = var_95,
+        cvar_95          = cvar_95,
+        expected_gain    = exp_gain,
+        expected_gain_pct = exp_gain_pct,
+    )
+
+
+def print_metrics(metrics: RiskMetrics, num_sims: int, time_horizon: int) -> None:
+    """Pretty-print the risk report to stdout."""
+    bar = "═" * 54
+    sign = "+" if metrics.expected_gain >= 0 else ""
+
+    print(f"\n{bar}")
+    print(f"  📊  Monte Carlo Risk Report — VTI Portfolio")
+    print(bar)
+    print(f"  Simulations      : {num_sims:>12,}")
+    print(f"  Time Horizon     : {time_horizon:>9} trading days")
+    print(f"  Initial Value    : ${metrics.initial_value:>12,.2f}")
+    print(bar)
+    print(f"  Expected Value   : ${metrics.expected_value:>12,.2f}")
+    print(f"  Median Value     : ${metrics.median_value:>12,.2f}")
+    print(f"  Std Deviation    : ${metrics.std_deviation:>12,.2f}")
+    print(f"  Best Case        : ${metrics.max_value:>12,.2f}")
+    print(f"  Worst Case       : ${metrics.min_value:>12,.2f}")
+    print(bar)
+    print(f"  Expected P&L     : {sign}${metrics.expected_gain:>11,.2f}  "
+          f"({sign}{metrics.expected_gain_pct:.1f}%)")
+    print(f"  Probability Loss : {metrics.prob_of_loss * 100:>11.2f}%")
+    print(f"  VaR  (95% conf.) : ${metrics.var_95:>12,.2f}")
+    print(f"  CVaR (95% conf.) : ${metrics.cvar_95:>12,.2f}")
+    loss_at_var = metrics.initial_value - metrics.var_95
+    print(f"  Max Loss @ VaR   : ${loss_at_var:>12,.2f}")
+    print(f"{bar}\n")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  5. Visualisation
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Dark, professional colour palette
+_BG_DARK  = "#0d1117"
+_BG_PANEL = "#161b22"
+_BORDER   = "#30363d"
+_TEXT_LO  = "#8b949e"
+_TEXT_HI  = "#e6edf3"
+_TEXT_MID = "#c9d1d9"
+_BLUE     = "#58a6ff"
+_GREEN    = "#3fb950"
+_RED      = "#f85149"
+_YELLOW   = "#d29922"
+_PURPLE   = "#bc8cff"
+
+
+def _apply_dark_style() -> None:
+    plt.rcParams.update({
+        "figure.facecolor":  _BG_DARK,
+        "axes.facecolor":    _BG_PANEL,
+        "axes.edgecolor":    _BORDER,
+        "axes.labelcolor":   _TEXT_MID,
+        "axes.titlecolor":   _TEXT_HI,
+        "text.color":        _TEXT_MID,
+        "xtick.color":       _TEXT_LO,
+        "ytick.color":       _TEXT_LO,
+        "grid.color":        _BORDER,
+        "grid.linewidth":    0.7,
+        "font.family":       "sans-serif",
+        "legend.facecolor":  _BG_PANEL,
+        "legend.edgecolor":  _BORDER,
+        "legend.fontsize":   8.5,
+    })
+
+
+def _fmt_usd(ax, axis: str = "y") -> None:
+    """Apply dollar-sign formatting to an axis."""
+    fmt = mticker.FuncFormatter(lambda x, _: f"${x:,.0f}")
+    if axis == "y":
+        ax.yaxis.set_major_formatter(fmt)
+    else:
+        ax.xaxis.set_major_formatter(fmt)
+
+
+def plot_results(
+    stats:   ReturnStats,
+    paths:   np.ndarray,
+    metrics: RiskMetrics,
+    num_sims: int,
+    time_horizon: int,
+    save_prefix: str = "",
+) -> None:
+    """
+    Generate three publication-quality charts:
+      1. VTI historical price series
+      2. Simulated portfolio paths (fan chart)
+      3. Distribution of final portfolio values (histogram)
+
+    Then assemble all three into a combined dashboard figure.
+    """
+    _apply_dark_style()
+
+    _plot_historical(stats, save_prefix)
+    _plot_paths(paths, metrics, num_sims, time_horizon, save_prefix)
+    _plot_histogram(paths, metrics, num_sims, save_prefix)
+    _plot_dashboard(stats, paths, metrics, num_sims, time_horizon, save_prefix)
+
+
+# ── Chart 1: Historical VTI Price ────────────────────────────────────────────
+
+def _plot_historical(stats: ReturnStats, save_prefix: str = "") -> None:
+    """Plot the VTI historical adjusted closing price."""
+    fig, ax = plt.subplots(figsize=(13, 4.5))
+
+    prices = stats.prices
+    ax.plot(prices.index, prices.values, color=_BLUE, linewidth=1.3, label=f"{TICKER} Adj. Close")
+
+    # Rolling 50-day moving average
+    ma50 = prices.rolling(50).mean()
+    ax.plot(ma50.index, ma50.values, color=_YELLOW, linewidth=1.0,
+            linestyle="--", alpha=0.85, label="50-Day MA")
+
+    ax.fill_between(prices.index, prices.values, prices.min() * 0.95,
+                    alpha=0.08, color=_BLUE)
+
+    ax.set_title(f"VTI — Historical Adjusted Closing Price  "
+                 f"({prices.index[0].date()} → {prices.index[-1].date()})",
+                 fontsize=13, fontweight="bold")
+    ax.set_xlabel("Date", fontsize=10)
+    ax.set_ylabel("Adjusted Price (USD)", fontsize=10)
+    _fmt_usd(ax)
+    ax.legend()
+    ax.grid(True, alpha=0.35)
+    plt.tight_layout()
+
+    fname = f"{save_prefix}vti_historical.png"
+    plt.savefig(fname, dpi=150, bbox_inches="tight")
+    print(f"  ✅  Saved: {fname}")
+    plt.close()
+
+
+# ── Chart 2: Simulated Paths ─────────────────────────────────────────────────
+
+def _plot_paths(
+    paths: np.ndarray,
+    metrics: RiskMetrics,
+    num_sims: int,
+    time_horizon: int,
+    save_prefix: str = "",
+) -> None:
+    """Fan chart of simulated portfolio trajectories."""
+    fig, ax = plt.subplots(figsize=(13, 6))
+    days = np.arange(time_horizon + 1)
+    N    = paths.shape[1]
+
+    # Draw a random sample of individual paths
+    sample_idx = np.random.default_rng(0).choice(N, size=min(120, N), replace=False)
+    for i in sample_idx:
+        ax.plot(days, paths[:, i], linewidth=0.4, alpha=0.22, color=_BLUE)
+
+    # Percentile bands
+    p5  = np.percentile(paths, 5,  axis=1)
+    p25 = np.percentile(paths, 25, axis=1)
+    p50 = np.percentile(paths, 50, axis=1)
+    p75 = np.percentile(paths, 75, axis=1)
+    p95 = np.percentile(paths, 95, axis=1)
+
+    ax.fill_between(days, p5,  p95, alpha=0.10, color=_BLUE,   label="5–95th Pct Band")
+    ax.fill_between(days, p25, p75, alpha=0.18, color=_BLUE,   label="25–75th Pct Band")
+    ax.plot(days, p5,  color=_RED,    lw=1.8, ls="--", label=f"5th Pct (VaR) — ${p5[-1]:,.0f}")
+    ax.plot(days, p50, color=_GREEN,  lw=2.2, ls="-",  label=f"Median — ${p50[-1]:,.0f}")
+    ax.plot(days, p95, color=_YELLOW, lw=1.8, ls="--", label=f"95th Pct — ${p95[-1]:,.0f}")
+    ax.axhline(metrics.initial_value, color=_TEXT_LO, lw=1.2, ls=":",
+               label=f"Initial — ${metrics.initial_value:,.0f}")
+
+    ax.set_title(
+        f"Monte Carlo Simulation — {num_sims:,} Paths over {time_horizon} Trading Days  "
+        f"[calibrated on {TICKER}]",
+        fontsize=12, fontweight="bold"
+    )
+    ax.set_xlabel("Trading Days Ahead", fontsize=10)
+    ax.set_ylabel("Portfolio Value (USD)", fontsize=10)
+    _fmt_usd(ax)
+    ax.legend(loc="upper left", ncol=2)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    fname = f"{save_prefix}simulation_paths.png"
+    plt.savefig(fname, dpi=150, bbox_inches="tight")
+    print(f"  ✅  Saved: {fname}")
+    plt.close()
+
+
+# ── Chart 3: Final Value Distribution ────────────────────────────────────────
+
+def _plot_histogram(
+    paths:   np.ndarray,
+    metrics: RiskMetrics,
+    num_sims: int,
+    save_prefix: str = "",
+) -> None:
+    """Histogram of final portfolio values, colour-coded by gain/loss."""
+    fig, ax = plt.subplots(figsize=(13, 5.5))
+    final = paths[-1, :]
+
+    n_bins = min(120, max(40, int(np.sqrt(len(final)))))
+    counts, edges = np.histogram(final, bins=n_bins)
+
+    for i, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])):
+        mid   = (lo + hi) / 2
+        color = _RED if mid < metrics.initial_value else _GREEN
+        ax.bar(lo, counts[i], width=(hi - lo), color=color, alpha=0.72, edgecolor="none")
+
+    # Vertical reference lines
+    ax.axvline(metrics.var_95,         color=_RED,    lw=2.0, ls="--",
+               label=f"VaR 95%: ${metrics.var_95:,.0f}")
+    ax.axvline(metrics.cvar_95,        color=_PURPLE, lw=1.6, ls=":",
+               label=f"CVaR 95%: ${metrics.cvar_95:,.0f}")
+    ax.axvline(metrics.expected_value, color=_BLUE,   lw=2.0, ls="-",
+               label=f"Mean: ${metrics.expected_value:,.0f}")
+    ax.axvline(metrics.median_value,   color=_YELLOW, lw=1.8, ls="-.",
+               label=f"Median: ${metrics.median_value:,.0f}")
+    ax.axvline(metrics.initial_value,  color=_TEXT_LO, lw=1.4, ls=":",
+               label=f"Initial: ${metrics.initial_value:,.0f}")
+
+    # Loss probability annotation
+    ax.text(0.98, 0.95,
+            f"P(loss) = {metrics.prob_of_loss * 100:.1f}%",
+            transform=ax.transAxes, ha="right", va="top",
+            fontsize=10.5, color=_RED, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.4", fc=_BG_PANEL, ec=_RED, alpha=0.9))
+
+    ax.set_title(
+        f"Distribution of Final Portfolio Values — {num_sims:,} Simulations  [{TICKER}]",
+        fontsize=12, fontweight="bold"
+    )
+    ax.set_xlabel("Final Portfolio Value (USD)", fontsize=10)
+    ax.set_ylabel("Frequency", fontsize=10)
+    _fmt_usd(ax, axis="x")
+    ax.legend(ncol=2)
+    ax.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+
+    fname = f"{save_prefix}final_distribution.png"
+    plt.savefig(fname, dpi=150, bbox_inches="tight")
+    print(f"  ✅  Saved: {fname}")
+    plt.close()
+
+
+# ── Chart 4: Combined Dashboard ───────────────────────────────────────────────
+
+def _plot_dashboard(
+    stats:   ReturnStats,
+    paths:   np.ndarray,
+    metrics: RiskMetrics,
+    num_sims: int,
+    time_horizon: int,
+    save_prefix: str = "",
+) -> None:
+    """Four-panel dashboard combining all charts and a metrics scorecard."""
+    _apply_dark_style()
+
+    fig = plt.figure(figsize=(18, 11))
+    fig.patch.set_facecolor(_BG_DARK)
+    fig.suptitle(
+        f"Monte Carlo Investment Risk Dashboard — {TICKER} Portfolio",
+        fontsize=16, fontweight="bold", color=_TEXT_HI, y=0.98
+    )
+
+    gs = gridspec.GridSpec(
+        2, 3, figure=fig,
+        hspace=0.48, wspace=0.38,
+        left=0.06, right=0.97, top=0.93, bottom=0.07
+    )
+
+    # ── Panel A: Historical Price (top, spans 2 cols) ─────────────────────
+    ax_hist = fig.add_subplot(gs[0, :2])
+    prices  = stats.prices
+    ax_hist.plot(prices.index, prices.values, color=_BLUE, lw=1.3)
+    ma50 = prices.rolling(50).mean()
+    ax_hist.plot(ma50.index, ma50.values, color=_YELLOW, lw=0.9, ls="--", alpha=0.8, label="50-Day MA")
+    ax_hist.fill_between(prices.index, prices.values, prices.min() * 0.95, alpha=0.07, color=_BLUE)
+    ax_hist.set_title(f"{TICKER} Historical Price  "
+                      f"({prices.index[0].date()} → {prices.index[-1].date()})",
+                      fontsize=10.5, fontweight="bold")
+    ax_hist.set_ylabel("Adj. Close (USD)", fontsize=9)
+    _fmt_usd(ax_hist)
+    ax_hist.legend(fontsize=8)
+    ax_hist.grid(True, alpha=0.3)
+
+    # ── Panel B: Metrics Scorecard (top-right) ────────────────────────────
+    ax_card = fig.add_subplot(gs[0, 2])
+    ax_card.set_facecolor(_BG_PANEL)
+    ax_card.axis("off")
+    ax_card.set_title("Risk Metrics", fontsize=10.5, fontweight="bold")
+
+    profit    = metrics.expected_gain
+    pl_pct    = metrics.expected_gain_pct
+    var_loss  = metrics.initial_value - metrics.var_95
+    cvar_loss = metrics.initial_value - metrics.cvar_95
+    sign      = "+" if profit >= 0 else ""
+
+    rows = [
+        ("Metric",               "Value",                    False),
+        ("Initial Investment",   f"${metrics.initial_value:,.0f}",       False),
+        ("Expected Final Value", f"${metrics.expected_value:,.0f}",      False),
+        ("Median Final Value",   f"${metrics.median_value:,.0f}",        False),
+        ("Std Deviation",        f"${metrics.std_deviation:,.0f}",       False),
+        ("Expected P&L",         f"{sign}${profit:,.0f} ({sign}{pl_pct:.1f}%)", profit >= 0),
+        ("Probability of Loss",  f"{metrics.prob_of_loss*100:.1f}%",    None),
+        ("VaR  (95% conf.)",     f"${metrics.var_95:,.0f}",             None),
+        ("Max Loss @ VaR",       f"${var_loss:,.0f}",                   None),
+        ("CVaR (95% conf.)",     f"${metrics.cvar_95:,.0f}",            None),
+        ("Max Loss @ CVaR",      f"${cvar_loss:,.0f}",                  None),
+    ]
+
+    y0, dy, xl, xr = 0.95, 0.083, 0.04, 0.56
+
+    for ridx, (label, value, is_good) in enumerate(rows):
+        y = y0 - ridx * dy
+        is_hdr = ridx == 0
+        fw = "bold" if is_hdr else "normal"
+        lc = _TEXT_HI if is_hdr else _TEXT_MID
+
+        if is_good is True:
+            vc = _GREEN
+        elif is_good is False and ridx > 0:
+            vc = _RED if "Loss" in label or "Probability" in label else _TEXT_MID
+        else:
+            vc = _RED if ("Loss" in label or "Probability" in label or
+                          "VaR" in label or "CVaR" in label) else _TEXT_MID
+
+        if is_hdr:
+            ax_card.plot([0.02, 0.98], [y - 0.015, y - 0.015],
+                         color=_BORDER, lw=0.8, transform=ax_card.transAxes)
+
+        ax_card.text(xl, y, label, transform=ax_card.transAxes,
+                     fontsize=8.2, fontweight=fw, color=lc, va="top")
+        ax_card.text(xr, y, value, transform=ax_card.transAxes,
+                     fontsize=8.2, fontweight=fw, color=vc, va="top",
+                     fontfamily="monospace")
+
+    # ── Panel C: Simulation Paths (bottom-left, spans 2 cols) ────────────
+    ax_paths = fig.add_subplot(gs[1, :2])
+    days = np.arange(time_horizon + 1)
+    N    = paths.shape[1]
+
+    sample_idx = np.random.default_rng(1).choice(N, size=min(80, N), replace=False)
+    for i in sample_idx:
+        ax_paths.plot(days, paths[:, i], lw=0.35, alpha=0.2, color=_BLUE)
+
+    p5  = np.percentile(paths, 5,  axis=1)
+    p50 = np.percentile(paths, 50, axis=1)
+    p95 = np.percentile(paths, 95, axis=1)
+
+    ax_paths.fill_between(days, p5, p95, alpha=0.10, color=_BLUE)
+    ax_paths.plot(days, p5,  color=_RED,    lw=1.6, ls="--", label=f"5th Pct — ${p5[-1]:,.0f}")
+    ax_paths.plot(days, p50, color=_GREEN,  lw=2.0,          label=f"Median — ${p50[-1]:,.0f}")
+    ax_paths.plot(days, p95, color=_YELLOW, lw=1.6, ls="--", label=f"95th Pct — ${p95[-1]:,.0f}")
+    ax_paths.axhline(metrics.initial_value, color=_TEXT_LO, lw=1.2, ls=":",
+                     label=f"Initial — ${metrics.initial_value:,.0f}")
+    ax_paths.set_title(f"{num_sims:,} Simulated Paths × {time_horizon} Days", fontsize=10.5, fontweight="bold")
+    ax_paths.set_xlabel("Trading Days Ahead", fontsize=9)
+    ax_paths.set_ylabel("Portfolio Value (USD)", fontsize=9)
+    _fmt_usd(ax_paths)
+    ax_paths.legend(ncol=2, fontsize=7.5)
+    ax_paths.grid(True, alpha=0.28)
+
+    # ── Panel D: Histogram (bottom-right) ────────────────────────────────
+    ax_h = fig.add_subplot(gs[1, 2])
+    final = paths[-1, :]
+    n_bins = min(80, int(np.sqrt(len(final))))
+    counts, edges = np.histogram(final, bins=n_bins)
+
+    for i, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])):
+        color = _RED if (lo + hi) / 2 < metrics.initial_value else _GREEN
+        ax_h.bar(lo, counts[i], width=(hi - lo), color=color, alpha=0.72, edgecolor="none")
+
+    ax_h.axvline(metrics.var_95,         color=_RED,    lw=1.8, ls="--", label=f"VaR")
+    ax_h.axvline(metrics.expected_value, color=_BLUE,   lw=1.8, label=f"Mean")
+    ax_h.axvline(metrics.initial_value,  color=_TEXT_LO, lw=1.2, ls=":", label="Initial")
+
+    ax_h.text(0.97, 0.96,
+              f"P(loss)\n{metrics.prob_of_loss * 100:.1f}%",
+              transform=ax_h.transAxes, ha="right", va="top",
+              fontsize=9, color=_RED, fontweight="bold",
+              bbox=dict(boxstyle="round,pad=0.3", fc=_BG_PANEL, ec=_RED, alpha=0.9))
+
+    ax_h.set_title("Final Value Distribution", fontsize=10.5, fontweight="bold")
+    ax_h.set_xlabel("Final Value (USD)", fontsize=9)
+    ax_h.set_ylabel("Frequency", fontsize=9)
+    _fmt_usd(ax_h, axis="x")
+    ax_h.xaxis.set_major_locator(mticker.MaxNLocator(4))
+    ax_h.legend(fontsize=7.5)
+    ax_h.grid(True, axis="y", alpha=0.28)
+
+    fname = f"{save_prefix}dashboard.png"
+    plt.savefig(fname, dpi=150, bbox_inches="tight")
+    print(f"  ✅  Saved: {fname}")
+    plt.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  6. Entry Point
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    """
+    Orchestrates the full analysis pipeline:
+      get_data → calculate_returns → simulate_portfolio → calculate_metrics
+      → print_metrics → plot_results
+    """
+    print("\n" + "═" * 54)
+    print("  Monte Carlo Simulation — VTI Portfolio Risk")
+    print("═" * 54 + "\n")
+
+    # ── User-configurable parameters ──────────────────────────────────────
+    initial_value   = INITIAL_VALUE     # USD
+    time_horizon    = TIME_HORIZON      # trading days
+    num_simulations = NUM_SIMULATIONS
+    lookback_years  = LOOKBACK_YEARS
+
+    # ── Pipeline ──────────────────────────────────────────────────────────
+    prices  = get_data(ticker=TICKER, lookback_years=lookback_years)
+    stats   = calculate_returns(prices)
+    paths   = simulate_portfolio(
+                  stats,
+                  initial_value = initial_value,
+                  time_horizon  = time_horizon,
+                  num_sims      = num_simulations,
+              )
+    metrics = calculate_metrics(paths, initial_value)
+    print_metrics(metrics, num_simulations, time_horizon)
+
+    print("  📈  Generating visualisations …\n")
+    plot_results(stats, paths, metrics, num_simulations, time_horizon)
+
+    print("  ✅  Analysis complete.\n")
+
+
+if __name__ == "__main__":
+    main()
